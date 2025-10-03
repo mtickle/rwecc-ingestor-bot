@@ -27,26 +27,30 @@ type Incident struct {
 
 // saveToUnifiedDB is the new core function. It normalizes and saves an incident.
 func saveToUnifiedDB(db *sql.DB, incident Incident) error {
-	// Normalize the data for the unified table
 	source := "RWECC"
-	sourceID := incident.Timestamp + " " + incident.Address // The unique key we've been using
-	eventType := "Vehicle Crash"                            // Standardize the event type
+	sourceID := incident.Timestamp + " " + incident.Address
+	eventType := "Vehicle Crash"
 
-	// Convert the timestamp string to a time.Time object
-	parsedTime, err := time.Parse("2006-01-02 15:04:05.000", incident.Timestamp)
+	// --- THE FIX ---
+	// Load the Eastern Time location.
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return fmt.Errorf("could not load time zone location: %w", err)
+	}
+
+	// Parse the incoming timestamp string AS Eastern Time.
+	parsedTime, err := time.ParseInLocation("2006-01-02 15:04:05.000", incident.Timestamp, loc)
 	if err != nil {
 		log.Printf("Could not parse timestamp '%s', using current time. Error: %v", incident.Timestamp, err)
 		parsedTime = time.Now()
 	}
+	// The database driver will automatically convert this to UTC for storage.
 
-	// Marshal the original, full incident struct into JSON for the 'details' column
 	detailsJSON, err := json.Marshal(incident)
 	if err != nil {
 		return fmt.Errorf("could not marshal incident details to JSON: %w", err)
 	}
 
-	// This is the key: an INSERT statement for the unified_incidents table.
-	// ON CONFLICT does nothing, ensuring we don't error on duplicates. The alerter handles newness.
 	sqlStatement := `
 		INSERT INTO unified_incidents (
 			source, source_id, event_type, status, address, latitude, longitude, timestamp, details
