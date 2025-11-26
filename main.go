@@ -25,15 +25,13 @@ type Incident struct {
 	Timestamp    string  `json:"timestamp"`
 }
 
-// --- NEW: Structs for the National Weather Service (NWS) API ---
-// NWSPointsResponse is for the first API call to get the forecast URL.
+// --- Structs for the National Weather Service (NWS) API ---
 type NWSPointsResponse struct {
 	Properties struct {
 		ForecastHourly string `json:"forecastHourly"`
 	} `json:"properties"`
 }
 
-// NWSHourlyResponse is for the second API call to get the actual weather data.
 type NWSHourlyResponse struct {
 	Properties struct {
 		Periods []WeatherData `json:"periods"`
@@ -43,86 +41,69 @@ type NWSHourlyResponse struct {
 // WeatherData holds the current weather conditions from the NWS.
 type WeatherData struct {
 	Temperature   int    `json:"temperature"`
-	WindSpeed     string `json:"windSpeed"` // e.g., "5 to 10 mph"
+	WindSpeed     string `json:"windSpeed"`
 	ShortForecast string `json:"shortForecast"`
 	Icon          string `json:"icon"`
 }
 
-// --- NEW: Function to get current weather data from the NWS ---
+// getWeatherForIncident fetches current weather conditions from the NWS API.
 func getWeatherForIncident(lat, lon float64) (*WeatherData, error) {
-	// Step 1: Get the specific forecast grid URL for the given coordinates.
 	pointsURL := fmt.Sprintf("https://api.weather.gov/points/%.4f,%.4f", lat, lon)
-
-	// The NWS API requires a User-Agent header.
-	client := &http.Client{}
+	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", pointsURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "(patrolx, mtickle@gmail.com)") // Recommended by NWS
+	req.Header.Set("User-Agent", "(patrolx, mtickle@gmail.com)")
 
 	pointsResp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch NWS points data: %w", err)
 	}
 	defer pointsResp.Body.Close()
-
 	if pointsResp.StatusCode != 200 {
 		return nil, fmt.Errorf("NWS points API returned non-200 status: %s", pointsResp.Status)
 	}
-
 	body, err := io.ReadAll(pointsResp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read NWS points response body: %w", err)
 	}
-
 	var pointsResponse NWSPointsResponse
 	if err := json.Unmarshal(body, &pointsResponse); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal NWS points JSON: %w", err)
 	}
-
 	if pointsResponse.Properties.ForecastHourly == "" {
 		return nil, fmt.Errorf("NWS points response did not contain a forecast URL")
 	}
 
-	// Step 2: Use the grid URL to get the hourly forecast.
-	hourlyURL := pointsResponse.Properties.ForecastHourly + "?units=us" // Request US units (Fahrenheit, mph)
-
-	req, err = http.NewRequest("GET", hourlyURL, nil)
+	req, err = http.NewRequest("GET", pointsResponse.Properties.ForecastHourly+"?units=us", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "(patrolx, mtickle@gmail.com)")
-
 	hourlyResp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch NWS hourly data: %w", err)
 	}
 	defer hourlyResp.Body.Close()
-
 	if hourlyResp.StatusCode != 200 {
 		return nil, fmt.Errorf("NWS hourly API returned non-200 status: %s", hourlyResp.Status)
 	}
-
 	hourlyBody, err := io.ReadAll(hourlyResp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read NWS hourly response body: %w", err)
 	}
-
 	var hourlyResponse NWSHourlyResponse
 	if err := json.Unmarshal(hourlyBody, &hourlyResponse); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal NWS hourly JSON: %w", err)
 	}
-
-	// The first period in the list is the current hour's forecast.
 	if len(hourlyResponse.Properties.Periods) > 0 {
 		return &hourlyResponse.Properties.Periods[0], nil
 	}
-
 	return nil, fmt.Errorf("no weather periods returned from NWS")
 }
 
-// saveToUnifiedDB now fetches weather from the NWS.
+// saveToUnifiedDB normalizes and saves an incident to the unified table.
 func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 	source := "RWECC"
 	sourceID := incident.Timestamp + " " + incident.Address
@@ -151,17 +132,38 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 		return fmt.Errorf("could not marshal unified details to JSON: %w", err)
 	}
 
+	// --- PREPARE NEW COLUMN VALUES ---
+	var weatherTemp sql.NullInt32
+	var weatherWind, weatherForecast sql.NullString
+
+	if weatherData != nil {
+		weatherTemp.Int32 = int32(weatherData.Temperature)
+		weatherTemp.Valid = true
+		weatherWind.String = weatherData.WindSpeed
+		weatherWind.Valid = true
+		weatherForecast.String = weatherData.ShortForecast
+		weatherForecast.Valid = true
+	}
+
+	// Updated SQL to populate jurisdiction, problem_detail, and weather columns
 	sqlStatement := `
 		INSERT INTO unified_incidents (
-			source, source_id, event_type, status, address, latitude, longitude, timestamp, details
-		) VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8)
+			source, source_id, event_type, status, address, latitude, longitude, timestamp, details,
+			jurisdiction, problem_detail, weather_temp, weather_wind_speed, weather_forecast
+		) VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		ON CONFLICT (source, source_id) DO UPDATE SET
 			details = EXCLUDED.details,
-			status = 'active';
+			status = 'active',
+			jurisdiction = EXCLUDED.jurisdiction,
+			problem_detail = EXCLUDED.problem_detail,
+			weather_temp = EXCLUDED.weather_temp,
+			weather_wind_speed = EXCLUDED.weather_wind_speed,
+			weather_forecast = EXCLUDED.weather_forecast;
 	`
 
 	_, err = db.Exec(sqlStatement,
 		source, sourceID, eventType, incident.Address, incident.Lat, incident.Long, parsedTime, detailsJSON,
+		incident.Jurisdiction, incident.Problem, weatherTemp, weatherWind, weatherForecast,
 	)
 	return err
 }
@@ -187,7 +189,6 @@ func main() {
 	log.Println("Successfully connected to the database.")
 
 	apiURL := os.Getenv("RWECC_URL")
-
 	if apiURL == "" {
 		log.Fatalln("Error: RWECC_URL must be set.")
 	}
