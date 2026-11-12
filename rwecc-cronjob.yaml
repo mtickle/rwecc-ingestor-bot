@@ -1,0 +1,21 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rwecc-ingestor
+  namespace: unity
+spec:
+  schedule: "*/5 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+
+          containers:
+          - name: rwecc
+            image: docker.io/library/rwecc-ingestor:latest
+            imagePullPolicy: Never
+
+            envFrom:
+            - secretRef:
+                name: rwecc-env

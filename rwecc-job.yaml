@@ -1,0 +1,19 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rwecc-test
+  namespace: unity
+
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+
+      containers:
+      - name: rwecc
+        image: docker.io/library/rwecc-ingestor:latest
+        imagePullPolicy: Never
+
+        envFrom:
+        - secretRef:
+            name: rwecc-env
