@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
-        _ "github.com/lib/pq"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 // Incident struct matches the JSON object structure from the API.
@@ -43,6 +45,14 @@ type WeatherData struct {
 	WindSpeed     string `json:"windSpeed"`
 	ShortForecast string `json:"shortForecast"`
 	Icon          string `json:"icon"`
+}
+
+func sanitizeURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "invalid-url"
+	}
+	return u.Host + u.Path
 }
 
 // getWeatherForIncident fetches current weather conditions from the NWS API.
@@ -102,8 +112,8 @@ func getWeatherForIncident(lat, lon float64) (*WeatherData, error) {
 	return nil, fmt.Errorf("no weather periods returned from NWS")
 }
 
-// saveToUnifiedDB normalizes and saves an incident to the unified table.
-func saveToUnifiedDB(db *sql.DB, incident Incident) error {
+// saveToUnifiedDB normalizes and saves an incident to the unified table, returning true if newly inserted.
+func saveToUnifiedDB(db *sql.DB, incident Incident) (bool, error) {
 	source := "RWECC"
 	sourceID := incident.Timestamp + " " + incident.Address
 	eventType := "Vehicle Crash"
@@ -111,14 +121,32 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 	loc, _ := time.LoadLocation("America/New_York")
 	parsedTime, err := time.ParseInLocation("2006-01-02 15:04:05.000", incident.Timestamp, loc)
 	if err != nil {
-		log.Printf("Could not parse timestamp '%s', using current time. Error: %v", incident.Timestamp, err)
+		slog.Warn("timestamp_parse_fallback",
+			"raw_timestamp", incident.Timestamp,
+			"address", incident.Address,
+			"error", err,
+		)
 		parsedTime = time.Now()
 	}
 
 	// --- ENRICHMENT STEP ---
+	weatherStart := time.Now()
 	weatherData, err := getWeatherForIncident(incident.Lat, incident.Long)
 	if err != nil {
-		log.Printf("Warning: could not fetch weather for incident '%s': %v", incident.Address, err)
+		slog.Warn("nws_enrichment_failed",
+			"address", incident.Address,
+			"lat", incident.Lat,
+			"lng", incident.Long,
+			"duration_ms", time.Since(weatherStart).Milliseconds(),
+			"error", err,
+		)
+	} else {
+		slog.Info("nws_enrichment_ok",
+			"address", incident.Address,
+			"temp_f", weatherData.Temperature,
+			"forecast", weatherData.ShortForecast,
+			"duration_ms", time.Since(weatherStart).Milliseconds(),
+		)
 	}
 
 	details := map[string]interface{}{
@@ -128,7 +156,7 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 
 	detailsJSON, err := json.Marshal(details)
 	if err != nil {
-		return fmt.Errorf("could not marshal unified details to JSON: %w", err)
+		return false, fmt.Errorf("could not marshal unified details to JSON: %w", err)
 	}
 
 	// --- PREPARE NEW COLUMN VALUES ---
@@ -144,7 +172,7 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 		weatherForecast.Valid = true
 	}
 
-	// Updated SQL to populate jurisdiction, problem_detail, and weather columns
+	// RETURNING (xmax = 0) distinguishes brand-new inserts (true) from conflict updates (false)
 	sqlStatement := `
 		INSERT INTO unified_incidents (
 			source, source_id, event_type, status, address, latitude, longitude, timestamp, details,
@@ -157,72 +185,141 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 			problem_detail = EXCLUDED.problem_detail,
 			weather_temp = EXCLUDED.weather_temp,
 			weather_wind_speed = EXCLUDED.weather_wind_speed,
-			weather_forecast = EXCLUDED.weather_forecast;
+			weather_forecast = EXCLUDED.weather_forecast
+		RETURNING (xmax = 0) AS inserted;
 	`
 
-	_, err = db.Exec(sqlStatement,
+	var wasInserted bool
+	err = db.QueryRow(sqlStatement,
 		source, sourceID, eventType, incident.Address, incident.Lat, incident.Long, parsedTime, detailsJSON,
 		incident.Jurisdiction, incident.Problem, weatherTemp, weatherWind, weatherForecast,
-	)
-	return err
+	).Scan(&wasInserted)
+
+	return wasInserted, err
 }
 
 func main() {
+	cycleStart := time.Now()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
 
+	if err := godotenv.Load(); err != nil {
+		slog.Debug("dotenv_not_loaded", "reason", "using container/environment variables")
+	}
 
-psqlInfo := fmt.Sprintf(
-    "host=%s port=%s user=%s password=%s dbname=%s sslmode=require",
-    os.Getenv("DATABASE_HOST"),
-    os.Getenv("DATABASE_PORT"),
-    os.Getenv("DATABASE_USERNAME"),
-    os.Getenv("DATABASE_PASSWORD"),
-    os.Getenv("DATABASE_NAME"),
-)
+	dbHost := os.Getenv("DATABASE_HOST")
+	apiURL := os.Getenv("RWECC_URL")
+	if apiURL == "" {
+		slog.Error("missing_required_env", "var", "RWECC_URL")
+		os.Exit(1)
+	}
+
+	slog.Info("ingest_cycle_started",
+		"service", "rwecc-ingestor-bot",
+		"db_host", dbHost,
+		"feed_endpoint", sanitizeURL(apiURL),
+	)
+
+	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=require",
+		dbHost, os.Getenv("DATABASE_PORT"), os.Getenv("DATABASE_USERNAME"),
+		os.Getenv("DATABASE_PASSWORD"), os.Getenv("DATABASE_NAME"))
 
 	db, err := sql.Open("postgres", psqlInfo)
 	if err != nil {
-		log.Fatalf("Error opening database: %s", err)
+		slog.Error("db_open_failed", "db_host", dbHost, "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
+	dbStart := time.Now()
 	if err := db.Ping(); err != nil {
-		log.Fatalf("Error connecting to database: %s", err)
+		slog.Error("db_ping_failed", "db_host", dbHost, "error", err)
+		os.Exit(1)
 	}
-	log.Println("Successfully connected to the database.")
+	slog.Info("db_connected", "db_host", dbHost, "latency_ms", time.Since(dbStart).Milliseconds())
 
-	apiURL := os.Getenv("RWECC_URL")
-	if apiURL == "" {
-		log.Fatalln("Error: RWECC_URL must be set.")
-	}
-
-	resp, err := http.Get(apiURL)
+	fetchStart := time.Now()
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := httpClient.Get(apiURL)
 	if err != nil {
-		log.Fatalf("Error fetching data from API: %s", err)
+		slog.Error("rwecc_fetch_failed", "endpoint", sanitizeURL(apiURL), "error", err)
+		os.Exit(1)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		slog.Error("rwecc_non_200_status", "status_code", resp.StatusCode, "status", resp.Status)
+		os.Exit(1)
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Fatalf("Error reading API response body: %s", err)
+		slog.Error("rwecc_body_read_failed", "error", err)
+		os.Exit(1)
 	}
 
 	var incidents []Incident
 	if err := json.Unmarshal(body, &incidents); err != nil {
-		log.Fatalf("Error unmarshalling JSON: %s", err)
+		slog.Error("rwecc_json_unmarshal_failed", "payload_bytes", len(body), "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("Searching for new MVC Incidents from RWECC API...")
-	incidentsSaved := 0
+	slog.Info("rwecc_feed_fetched",
+		"status_code", resp.StatusCode,
+		"payload_bytes", len(body),
+		"total_raw_incidents", len(incidents),
+		"fetch_duration_ms", time.Since(fetchStart).Milliseconds(),
+	)
+
+	insertedCount := 0
+	updatedCount := 0
+	skippedNonMVC := 0
+	failedCount := 0
 
 	for _, incident := range incidents {
-		if strings.Contains(incident.Problem, "MVC") {
-			if err := saveToUnifiedDB(db, incident); err != nil {
-				log.Printf("Error saving incident for '%s': %v", incident.Address, err)
-			} else {
-				incidentsSaved++
-			}
+		if !strings.Contains(incident.Problem, "MVC") {
+			skippedNonMVC++
+			continue
 		}
+
+		wasInserted, err := saveToUnifiedDB(db, incident)
+		if err != nil {
+			failedCount++
+			slog.Error("incident_upsert_failed",
+				"jurisdiction", incident.Jurisdiction,
+				"problem", incident.Problem,
+				"address", incident.Address,
+				"error", err,
+			)
+			continue
+		}
+
+		action := "updated"
+		if wasInserted {
+			insertedCount++
+			action = "inserted"
+		} else {
+			updatedCount++
+		}
+
+		slog.Info("mvc_incident_synced",
+			"action", action,
+			"jurisdiction", incident.Jurisdiction,
+			"problem", incident.Problem,
+			"address", incident.Address,
+			"timestamp", incident.Timestamp,
+		)
 	}
 
-	log.Printf("Run complete. Processed and saved %d MVC incidents to the unified table.", incidentsSaved)
+	slog.Info("ingest_cycle_completed",
+		"service", "rwecc-ingestor-bot",
+		"raw_total", len(incidents),
+		"mvc_inserted", insertedCount,
+		"mvc_updated", updatedCount,
+		"non_mvc_skipped", skippedNonMVC,
+		"failed", failedCount,
+		"total_duration_ms", time.Since(cycleStart).Milliseconds(),
+	)
 }
