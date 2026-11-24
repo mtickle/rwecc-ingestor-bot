@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "time/tzdata"
 	"database/sql"
 	"encoding/json"
 	"fmt"
