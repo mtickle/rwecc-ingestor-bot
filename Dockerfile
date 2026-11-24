@@ -1,23 +1,16 @@
-FROM golang:1.22 AS builder
+FROM golang:1.27 AS builder
 
 WORKDIR /build
 
 COPY . .
 
 RUN go mod download
-RUN go build -o rwecc-ingestor main.go
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o rwecc-ingestor main.go
 
 
+FROM scratch
 
-FROM debian:bookworm-slim
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /build/rwecc-ingestor /rwecc-ingestor
 
-RUN apt-get update && \
-    apt-get install -y ca-certificates && \
-    update-ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY --from=builder /build/rwecc-ingestor .
-
-CMD ["./rwecc-ingestor"]
+CMD ["/rwecc-ingestor"]
